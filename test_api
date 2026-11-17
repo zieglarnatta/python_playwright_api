@@ -1,0 +1,34 @@
+# test_api.py
+import requests, uuid, pytest
+
+BASE = "http://localhost:8000"
+
+@pytest.fixture
+def user_token():
+    u = f"user_{uuid.uuid4().hex[:8]}"
+    p = "pass1234"
+    requests.post(f"{BASE}/api/register", json={"username": u, "password": p})
+    r = requests.post(f"{BASE}/api/login", json={"username": u, "password": p})
+    return r.json()["access_token"]
+
+def test_register_and_login(user_token):
+    assert user_token
+
+def test_products_list():
+    r = requests.get(f"{BASE}/api/products")
+    assert r.status_code == 200
+    assert len(r.json()) >= 5
+
+def test_add_to_cart_and_checkout(user_token):
+    h = {"Authorization": f"Bearer {user_token}"}
+    requests.post(f"{BASE}/api/cart/add", json={"product_id": 1, "quantity": 1}, headers=h)
+    cart = requests.get(f"{BASE}/api/cart", headers=h).json()
+    assert cart["total"] > 0
+    r = requests.post(f"{BASE}/api/checkout", headers=h)
+    assert r.status_code == 200
+    assert r.json()["status"] == "PAID"
+
+def test_checkout_empty_cart_fails(user_token):
+    h = {"Authorization": f"Bearer {user_token}"}
+    r = requests.post(f"{BASE}/api/checkout", headers=h)
+    assert r.status_code == 400

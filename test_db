@@ -1,0 +1,6 @@
+import sqlite3
+
+def test_order_row_created():
+    conn = sqlite3.connect("shop.db")
+    count = conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+    assert count > 0
