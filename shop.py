@@ -13,6 +13,7 @@ Then open http://localhost:8000
 Docs at http://localhost:8000/docs
 """
 
+import os
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager
@@ -37,8 +38,21 @@ from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from pydantic import BaseModel, Field
 
+try:
+    import psycopg2
+    from psycopg2.extras import DictCursor
+except ImportError:
+    psycopg2 = None
+    DictCursor = None
+
 # ----------------------------- CONFIG ---------------------------------------
 DB_PATH = Path(__file__).parent / "shop.db"
+DATABASE_URL = os.getenv("DATABASE_URL")
+DOCKER_DATABASE_URL = (
+    "postgresql://shop:shop_dev_password@localhost:5432/shop"
+)
+ACTIVE_DATABASE_URL: Optional[str] = None
+DATABASE_SELECTED = False
 SECRET_KEY = "test-secret-do-not-use-in-prod"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
@@ -46,6 +60,9 @@ GUEST_COOKIE = "guest_id"
 GUEST_COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login", auto_error=False)
+INTEGRITY_ERRORS = [sqlite3.IntegrityError]
+if psycopg2 is not None:
+    INTEGRITY_ERRORS.append(psycopg2.IntegrityError)
 
 
 def utcnow() -> datetime:
@@ -65,10 +82,104 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 
 # ----------------------------- DATABASE -------------------------------------
+def select_database():
+    global ACTIVE_DATABASE_URL, DATABASE_SELECTED
+    if DATABASE_SELECTED:
+        return
+
+    DATABASE_SELECTED = True
+    if DATABASE_URL:
+        ACTIVE_DATABASE_URL = DATABASE_URL
+        return
+
+    if psycopg2 is None:
+        print(
+            "[database] psycopg2 is not installed; using SQLite. "
+            "Install psycopg2-binary to auto-detect Docker PostgreSQL."
+        )
+        return
+
+    try:
+        probe = psycopg2.connect(DOCKER_DATABASE_URL, connect_timeout=2)
+    except psycopg2.OperationalError as error:
+        print(
+            "[database] Docker PostgreSQL is unavailable "
+            f"({error}); using SQLite at {DB_PATH}."
+        )
+        return
+
+    probe.close()
+    ACTIVE_DATABASE_URL = DOCKER_DATABASE_URL
+    print("[database] Docker PostgreSQL detected; using its shop database.")
+
+
+class DatabaseConnection:
+    def __init__(self, connection, is_postgres=False):
+        self.connection = connection
+        self.is_postgres = is_postgres
+
+    def execute(self, query, parameters=()):
+        cursor = self.cursor()
+        if (
+            self.is_postgres
+            and query.strip().upper() == "BEGIN"
+            and self.connection.get_transaction_status()
+            == psycopg2.extensions.TRANSACTION_STATUS_INTRANS
+        ):
+            return cursor
+        cursor.execute(self._adapt_query(query), parameters)
+        return cursor
+
+    def executemany(self, query, parameters):
+        cursor = self.cursor()
+        cursor.executemany(self._adapt_query(query), parameters)
+        return cursor
+
+    def executescript(self, script):
+        if not self.is_postgres:
+            return self.connection.executescript(script)
+        cursor = self.cursor()
+        for statement in script.split(";"):
+            if statement.strip():
+                cursor.execute(statement)
+
+    def cursor(self):
+        if self.is_postgres:
+            return self.connection.cursor(cursor_factory=DictCursor)
+        return self.connection.cursor()
+
+    def _adapt_query(self, query):
+        return query.replace("?", "%s") if self.is_postgres else query
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+
+def connect_db():
+    select_database()
+    if ACTIVE_DATABASE_URL:
+        if psycopg2 is None:
+            raise RuntimeError(
+                "DATABASE_URL is set, but psycopg2 is not installed. "
+                "Install it with: python3 -m pip install psycopg2-binary"
+            )
+        return DatabaseConnection(
+            psycopg2.connect(ACTIVE_DATABASE_URL), is_postgres=True
+        )
+
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return DatabaseConnection(connection)
+
+
+def database_description():
+    select_database()
+    return "PostgreSQL" if ACTIVE_DATABASE_URL else str(DB_PATH)
+
+
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
+    conn = connect_db()
     try:
         yield conn
     finally:
@@ -76,11 +187,8 @@ def get_db():
 
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.executescript(
-        """
+    conn = connect_db()
+    schema = """
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
@@ -130,7 +238,11 @@ def init_db():
             FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
         );
         """
-    )
+    if ACTIVE_DATABASE_URL:
+        schema = schema.replace(
+            "INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY"
+        )
+    conn.executescript(schema)
 
     if conn.execute("SELECT id FROM users WHERE username = 'admin'").fetchone() is None:
         conn.execute(
@@ -196,7 +308,7 @@ def create_token(user_id: int, username: str, role: str) -> str:
 
 def get_current_user(
     token: Optional[str] = Depends(oauth2_scheme),
-    db: sqlite3.Connection = Depends(get_db),
+    db: DatabaseConnection = Depends(get_db),
 ):
     cred_exc = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -227,7 +339,7 @@ def get_cart_owner(
     response: Response,
     token: Optional[str] = Depends(oauth2_scheme),
     guest_id: Optional[str] = Cookie(None),
-    db: sqlite3.Connection = Depends(get_db),
+    db: DatabaseConnection = Depends(get_db),
 ):
     user = None
     if token:
@@ -267,7 +379,7 @@ def cart_owner_column(owner) -> tuple[str, tuple]:
 async def lifespan(app: FastAPI):
     init_db()
     app.state.started_at = utcnow()
-    print(f"[startup] DB ready at {DB_PATH}")
+    print(f"[startup] DB ready: {database_description()}")
     yield
     print("[shutdown] bye")
 
@@ -302,22 +414,23 @@ def options_products(response: Response):
 
 # ---------- Auth ----------
 @app.post("/api/register", status_code=201)
-def register(body: RegisterIn, db: sqlite3.Connection = Depends(get_db)):
+def register(body: RegisterIn, db: DatabaseConnection = Depends(get_db)):
     if len(body.username) < 3 or len(body.password) < 4:
         raise HTTPException(400, "Username >=3 chars, password >=4 chars")
     try:
         cur = db.execute(
-            "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?) RETURNING id",
             (body.username, hash_password(body.password), "customer", utcnow_iso()),
         )
+        user_id = cur.fetchone()[0]
         db.commit()
-    except sqlite3.IntegrityError:
+    except tuple(INTEGRITY_ERRORS):
         raise HTTPException(409, "Username already exists")
-    return {"id": cur.lastrowid, "username": body.username, "role": "customer"}
+    return {"id": user_id, "username": body.username, "role": "customer"}
 
 
 @app.post("/api/login")
-def login(body: LoginIn, db: sqlite3.Connection = Depends(get_db)):
+def login(body: LoginIn, db: DatabaseConnection = Depends(get_db)):
     row = db.execute(
         "SELECT * FROM users WHERE username = ?", (body.username,)
     ).fetchone()
@@ -339,13 +452,13 @@ def me(user=Depends(get_current_user)):
 
 # ---------- Products ----------
 @app.get("/api/products")
-def list_products(db: sqlite3.Connection = Depends(get_db)):
+def list_products(db: DatabaseConnection = Depends(get_db)):
     rows = db.execute("SELECT * FROM products ORDER BY id").fetchall()
     return [dict(r) for r in rows]
 
 
 @app.get("/api/products/{product_id}")
-def get_product(product_id: int, db: sqlite3.Connection = Depends(get_db)):
+def get_product(product_id: int, db: DatabaseConnection = Depends(get_db)):
     row = db.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Product not found")
@@ -356,16 +469,17 @@ def get_product(product_id: int, db: sqlite3.Connection = Depends(get_db)):
 def create_product(
     body: ProductReplaceIn,
     admin=Depends(require_admin),
-    db: sqlite3.Connection = Depends(get_db),
+    db: DatabaseConnection = Depends(get_db),
 ):
     now = utcnow_iso()
     cur = db.execute(
-        "INSERT INTO products (name, description, price, stock, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO products (name, description, price, stock, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
         (body.name, body.description, body.price, body.stock, now, now),
     )
+    product_id = cur.fetchone()[0]
     db.commit()
     row = db.execute(
-        "SELECT * FROM products WHERE id = ?", (cur.lastrowid,)
+        "SELECT * FROM products WHERE id = ?", (product_id,)
     ).fetchone()
     return dict(row)
 
@@ -375,7 +489,7 @@ def replace_product(
     product_id: int,
     body: ProductReplaceIn,
     admin=Depends(require_admin),
-    db: sqlite3.Connection = Depends(get_db),
+    db: DatabaseConnection = Depends(get_db),
 ):
     exists = db.execute(
         "SELECT id FROM products WHERE id = ?", (product_id,)
@@ -396,7 +510,7 @@ def patch_product(
     product_id: int,
     body: ProductPatchIn,
     admin=Depends(require_admin),
-    db: sqlite3.Connection = Depends(get_db),
+    db: DatabaseConnection = Depends(get_db),
 ):
     row = db.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
     if not row:
@@ -423,7 +537,7 @@ def patch_product(
 def delete_product(
     product_id: int,
     admin=Depends(require_admin),
-    db: sqlite3.Connection = Depends(get_db),
+    db: DatabaseConnection = Depends(get_db),
 ):
     exists = db.execute(
         "SELECT id FROM products WHERE id = ?", (product_id,)
@@ -440,7 +554,7 @@ def delete_product(
 def cart_add(
     body: CartItemIn,
     owner=Depends(get_cart_owner),
-    db: sqlite3.Connection = Depends(get_db),
+    db: DatabaseConnection = Depends(get_db),
 ):
     if body.quantity < 1:
         raise HTTPException(400, "quantity must be >= 1")
@@ -472,7 +586,7 @@ def cart_add(
 
 @app.get("/api/cart")
 def cart_view(
-    owner=Depends(get_cart_owner), db: sqlite3.Connection = Depends(get_db)
+    owner=Depends(get_cart_owner), db: DatabaseConnection = Depends(get_db)
 ):
     col, params = cart_owner_column(owner)
     rows = db.execute(
@@ -491,7 +605,7 @@ def cart_set_quantity(
     product_id: int,
     body: CartItemIn,
     owner=Depends(get_cart_owner),
-    db: sqlite3.Connection = Depends(get_db),
+    db: DatabaseConnection = Depends(get_db),
 ):
     if body.quantity < 1:
         raise HTTPException(400, "quantity must be >= 1")
@@ -516,7 +630,7 @@ def cart_set_quantity(
 def cart_delete_item(
     product_id: int,
     owner=Depends(get_cart_owner),
-    db: sqlite3.Connection = Depends(get_db),
+    db: DatabaseConnection = Depends(get_db),
 ):
     col, params = cart_owner_column(owner)
     cur = db.execute(
@@ -531,7 +645,7 @@ def cart_delete_item(
 
 @app.delete("/api/cart", status_code=204)
 def cart_clear(
-    owner=Depends(get_cart_owner), db: sqlite3.Connection = Depends(get_db)
+    owner=Depends(get_cart_owner), db: DatabaseConnection = Depends(get_db)
 ):
     col, params = cart_owner_column(owner)
     db.execute(f"DELETE FROM carts WHERE {col} = ?", params)
@@ -543,7 +657,7 @@ def cart_clear(
 def cart_merge(
     guest_id: Optional[str] = Cookie(None),
     user=Depends(get_current_user),
-    db: sqlite3.Connection = Depends(get_db),
+    db: DatabaseConnection = Depends(get_db),
 ):
     if not guest_id:
         return {"merged": 0}
@@ -564,7 +678,7 @@ def cart_merge(
 
 # ---------- Checkout ----------
 @app.post("/api/checkout")
-def checkout(user=Depends(get_current_user), db: sqlite3.Connection = Depends(get_db)):
+def checkout(user=Depends(get_current_user), db: DatabaseConnection = Depends(get_db)):
     items = db.execute(
         """SELECT c.product_id, p.name, p.price, p.stock, c.quantity
            FROM carts c JOIN products p ON p.id = c.product_id
@@ -608,7 +722,7 @@ def checkout(user=Depends(get_current_user), db: sqlite3.Connection = Depends(ge
 
 # ---------- Orders ----------
 @app.get("/api/orders")
-def list_orders(user=Depends(get_current_user), db: sqlite3.Connection = Depends(get_db)):
+def list_orders(user=Depends(get_current_user), db: DatabaseConnection = Depends(get_db)):
     rows = db.execute(
         "SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC",
         (user["id"],),
@@ -627,7 +741,7 @@ def list_orders(user=Depends(get_current_user), db: sqlite3.Connection = Depends
 
 @app.get("/api/orders/{order_id}")
 def get_order(
-    order_id: str, user=Depends(get_current_user), db: sqlite3.Connection = Depends(get_db)
+    order_id: str, user=Depends(get_current_user), db: DatabaseConnection = Depends(get_db)
 ):
     o = db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
     if not o or (o["user_id"] != user["id"] and user["role"] != "admin"):
@@ -643,7 +757,7 @@ def get_order(
 
 @app.delete("/api/orders/{order_id}", status_code=204)
 def delete_order(
-    order_id: str, user=Depends(get_current_user), db: sqlite3.Connection = Depends(get_db)
+    order_id: str, user=Depends(get_current_user), db: DatabaseConnection = Depends(get_db)
 ):
     o = db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
     if not o or (o["user_id"] != user["id"] and user["role"] != "admin"):
@@ -1231,6 +1345,6 @@ def index():
 
 # ----------------------------- ENTRYPOINT -----------------------------------
 if __name__ == "__main__":
-    print(f"DB file: {DB_PATH}")
+    print(f"Database: {database_description()}")
     print("Server: http://localhost:8000  |  Docs: http://localhost:8000/docs")
     uvicorn.run(app, host="0.0.0.0", port=8000)
