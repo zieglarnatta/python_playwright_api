@@ -173,12 +173,10 @@ curl -I $BASE/api/products/1
 curl -i -X OPTIONS $BASE/api/products
 ```
 
-# --- Auth: get a customer token ---
+# --- Auth: get a token for the seeded customer ---
 ```
-curl -s -X POST $BASE/api/register -H 'Content-Type: application/json' \
-  -d '{"username":"qa_cust","password":"pass1234"}'
 CUST=$(curl -s -X POST $BASE/api/login -H 'Content-Type: application/json' \
-  -d '{"username":"qa_cust","password":"pass1234"}' | python -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+  -d '{"username":"customer","password":"customer1234"}' | python -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
 ```
 
 # --- Auth: get an admin token ---
@@ -357,11 +355,16 @@ python -m pip install psycopg2-binary
 python shop.py
 ```
 
-Open http://localhost:8000. The app creates its tables and seed data
-automatically when it starts. The sample admin credentials are `admin` /
-`admin1234`, and the sample customer credentials are `customer` /
-`customer1234`; these demo credentials are for local testing only. Customers
-can also register through the app or `/api/register`.
+Open http://localhost:8000. When the app starts and connects to PostgreSQL, it
+creates its tables and seeds these demo accounts if they do not already exist:
+
+| Role | Username | Password |
+| --- | --- | --- |
+| Admin | `admin` | `admin1234` |
+| Customer | `customer` | `customer1234` |
+
+These credentials are for local testing only. Customers can also register
+through the app or `/api/register`.
 Guests can add items and check out without logging in; inventory is deducted
 when checkout succeeds, and guest orders remain available in the same browser
 through its guest cookie. To use another PostgreSQL server, set `DATABASE_URL`
