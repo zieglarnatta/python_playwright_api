@@ -58,6 +58,8 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 GUEST_COOKIE = "guest_id"
 GUEST_COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
+DEMO_CUSTOMER_USERNAME = "customer"
+DEMO_CUSTOMER_PASSWORD = "customer1234"
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login", auto_error=False)
 INTEGRITY_ERRORS = [sqlite3.IntegrityError]
@@ -221,7 +223,8 @@ def init_db():
 
         CREATE TABLE IF NOT EXISTS orders (
             id TEXT PRIMARY KEY,
-            user_id INTEGER NOT NULL,
+            user_id INTEGER,
+            guest_id TEXT,
             total REAL NOT NULL,
             status TEXT NOT NULL,
             created_at TEXT NOT NULL,
@@ -244,10 +247,67 @@ def init_db():
         )
     conn.executescript(schema)
 
+    if conn.is_postgres:
+        conn.execute("ALTER TABLE orders ALTER COLUMN user_id DROP NOT NULL")
+        conn.execute("ALTER TABLE orders ADD COLUMN IF NOT EXISTS guest_id TEXT")
+    else:
+        order_columns = {
+            row["name"]: row for row in conn.execute("PRAGMA table_info(orders)")
+        }
+        if order_columns["user_id"]["notnull"] or "guest_id" not in order_columns:
+            conn.execute("PRAGMA foreign_keys = OFF")
+            try:
+                conn.execute("BEGIN")
+                conn.execute(
+                    """CREATE TABLE orders_new (
+                        id TEXT PRIMARY KEY,
+                        user_id INTEGER,
+                        guest_id TEXT,
+                        total REAL NOT NULL,
+                        status TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                    )"""
+                )
+                guest_id_column = (
+                    "guest_id" if "guest_id" in order_columns else "NULL"
+                )
+                conn.execute(
+                    f"""INSERT INTO orders_new
+                        (id, user_id, guest_id, total, status, created_at)
+                        SELECT id, user_id, {guest_id_column}, total, status, created_at
+                        FROM orders"""
+                )
+                conn.execute("DROP TABLE orders")
+                conn.execute("ALTER TABLE orders_new RENAME TO orders")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.execute("PRAGMA foreign_keys = ON")
+
     if conn.execute("SELECT id FROM users WHERE username = 'admin'").fetchone() is None:
         conn.execute(
             "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)",
             ("admin", hash_password("admin1234"), "admin", utcnow_iso()),
+        )
+
+    if (
+        conn.execute(
+            "SELECT id FROM users WHERE username = ?",
+            (DEMO_CUSTOMER_USERNAME,),
+        ).fetchone()
+        is None
+    ):
+        conn.execute(
+            "INSERT INTO users (username, password_hash, role, created_at) VALUES (?, ?, ?, ?)",
+            (
+                DEMO_CUSTOMER_USERNAME,
+                hash_password(DEMO_CUSTOMER_PASSWORD),
+                "customer",
+                utcnow_iso(),
+            ),
         )
 
     if conn.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
@@ -354,7 +414,7 @@ def get_cart_owner(
             user = None
 
     if user:
-        return {"user_id": user["id"], "guest_id": None, "user": user}
+        return {"user_id": user["id"], "guest_id": guest_id, "user": user}
 
     if not guest_id:
         guest_id = str(uuid.uuid4())
@@ -372,6 +432,17 @@ def cart_owner_column(owner) -> tuple[str, tuple]:
     if owner["user_id"] is not None:
         return "user_id", (owner["user_id"],)
     return "guest_id", (owner["guest_id"],)
+
+
+def order_owner_filter(owner) -> tuple[str, tuple]:
+    if owner["user_id"] is not None:
+        if owner["guest_id"]:
+            return "(user_id = ? OR guest_id = ?)", (
+                owner["user_id"],
+                owner["guest_id"],
+            )
+        return "user_id = ?", (owner["user_id"],)
+    return "guest_id = ?", (owner["guest_id"],)
 
 
 # ----------------------------- LIFESPAN -------------------------------------
@@ -570,14 +641,14 @@ def cart_add(
         db.execute(
             """INSERT INTO carts (user_id, product_id, quantity) VALUES (?, ?, ?)
                ON CONFLICT(user_id, product_id)
-               DO UPDATE SET quantity = quantity + excluded.quantity""",
+               DO UPDATE SET quantity = carts.quantity + excluded.quantity""",
             (owner["user_id"], body.product_id, body.quantity),
         )
     else:
         db.execute(
             """INSERT INTO carts (guest_id, product_id, quantity) VALUES (?, ?, ?)
                ON CONFLICT(guest_id, product_id)
-               DO UPDATE SET quantity = quantity + excluded.quantity""",
+               DO UPDATE SET quantity = carts.quantity + excluded.quantity""",
             (owner["guest_id"], body.product_id, body.quantity),
         )
     db.commit()
@@ -668,7 +739,7 @@ def cart_merge(
         db.execute(
             """INSERT INTO carts (user_id, product_id, quantity) VALUES (?, ?, ?)
                ON CONFLICT(user_id, product_id)
-               DO UPDATE SET quantity = quantity + excluded.quantity""",
+               DO UPDATE SET quantity = carts.quantity + excluded.quantity""",
             (user["id"], r["product_id"], r["quantity"]),
         )
     db.execute("DELETE FROM carts WHERE guest_id = ?", (guest_id,))
@@ -678,41 +749,56 @@ def cart_merge(
 
 # ---------- Checkout ----------
 @app.post("/api/checkout")
-def checkout(user=Depends(get_current_user), db: DatabaseConnection = Depends(get_db)):
-    items = db.execute(
-        """SELECT c.product_id, p.name, p.price, p.stock, c.quantity
-           FROM carts c JOIN products p ON p.id = c.product_id
-           WHERE c.user_id = ?""",
-        (user["id"],),
-    ).fetchall()
-    if not items:
-        raise HTTPException(400, "Cart is empty")
-
-    for it in items:
-        if it["stock"] < it["quantity"]:
-            raise HTTPException(400, f"Insufficient stock for {it['name']}")
-
-    total = round(sum(it["price"] * it["quantity"] for it in items), 2)
-    order_id = str(uuid.uuid4())
-    now = utcnow_iso()
-
+def checkout(owner=Depends(get_cart_owner), db: DatabaseConnection = Depends(get_db)):
+    col, params = cart_owner_column(owner)
     try:
         db.execute("BEGIN")
+        items = db.execute(
+            f"""SELECT c.product_id, p.name, p.price, p.stock, c.quantity
+                FROM carts c JOIN products p ON p.id = c.product_id
+                WHERE c.{col} = ?""",
+            params,
+        ).fetchall()
+        if not items:
+            raise HTTPException(400, "Cart is empty")
+
+        for it in items:
+            if it["stock"] < it["quantity"]:
+                raise HTTPException(400, f"Insufficient stock for {it['name']}")
+
+        total = round(sum(it["price"] * it["quantity"] for it in items), 2)
+        order_id = str(uuid.uuid4())
+        now = utcnow_iso()
         db.execute(
-            "INSERT INTO orders (id, user_id, total, status, created_at) VALUES (?, ?, ?, ?, ?)",
-            (order_id, user["id"], total, "PAID", now),
+            """INSERT INTO orders
+               (id, user_id, guest_id, total, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                order_id,
+                owner["user_id"],
+                owner["guest_id"] if owner["user_id"] is None else None,
+                total,
+                "PAID",
+                now,
+            ),
         )
         for it in items:
             db.execute(
                 "INSERT INTO order_items (order_id, product_id, product_name, price, quantity) VALUES (?, ?, ?, ?, ?)",
                 (order_id, it["product_id"], it["name"], it["price"], it["quantity"]),
             )
-            db.execute(
-                "UPDATE products SET stock = stock - ? WHERE id = ?",
-                (it["quantity"], it["product_id"]),
+            updated = db.execute(
+                """UPDATE products SET stock = stock - ?
+                   WHERE id = ? AND stock >= ?""",
+                (it["quantity"], it["product_id"], it["quantity"]),
             )
-        db.execute("DELETE FROM carts WHERE user_id = ?", (user["id"],))
+            if updated.rowcount != 1:
+                raise HTTPException(400, f"Insufficient stock for {it['name']}")
+        db.execute(f"DELETE FROM carts WHERE {col} = ?", params)
         db.commit()
+    except HTTPException:
+        db.rollback()
+        raise
     except Exception:
         db.rollback()
         raise HTTPException(500, "Checkout failed")
@@ -722,10 +808,11 @@ def checkout(user=Depends(get_current_user), db: DatabaseConnection = Depends(ge
 
 # ---------- Orders ----------
 @app.get("/api/orders")
-def list_orders(user=Depends(get_current_user), db: DatabaseConnection = Depends(get_db)):
+def list_orders(owner=Depends(get_cart_owner), db: DatabaseConnection = Depends(get_db)):
+    owner_filter, params = order_owner_filter(owner)
     rows = db.execute(
-        "SELECT * FROM orders WHERE user_id = ? ORDER BY created_at DESC",
-        (user["id"],),
+        f"SELECT * FROM orders WHERE {owner_filter} ORDER BY created_at DESC",
+        params,
     ).fetchall()
     orders = []
     for o in rows:
@@ -741,10 +828,16 @@ def list_orders(user=Depends(get_current_user), db: DatabaseConnection = Depends
 
 @app.get("/api/orders/{order_id}")
 def get_order(
-    order_id: str, user=Depends(get_current_user), db: DatabaseConnection = Depends(get_db)
+    order_id: str,
+    owner=Depends(get_cart_owner),
+    db: DatabaseConnection = Depends(get_db),
 ):
     o = db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-    if not o or (o["user_id"] != user["id"] and user["role"] != "admin"):
+    is_owner = o and (
+        (owner["user_id"] is not None and o["user_id"] == owner["user_id"])
+        or (owner["guest_id"] is not None and o["guest_id"] == owner["guest_id"])
+    )
+    if not o or (not is_owner and not (owner["user"] and owner["user"]["role"] == "admin")):
         raise HTTPException(404, "Order not found")
     items = db.execute(
         "SELECT product_id, product_name, price, quantity FROM order_items WHERE order_id = ?",
@@ -757,10 +850,16 @@ def get_order(
 
 @app.delete("/api/orders/{order_id}", status_code=204)
 def delete_order(
-    order_id: str, user=Depends(get_current_user), db: DatabaseConnection = Depends(get_db)
+    order_id: str,
+    owner=Depends(get_cart_owner),
+    db: DatabaseConnection = Depends(get_db),
 ):
     o = db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-    if not o or (o["user_id"] != user["id"] and user["role"] != "admin"):
+    is_owner = o and (
+        (owner["user_id"] is not None and o["user_id"] == owner["user_id"])
+        or (owner["guest_id"] is not None and o["guest_id"] == owner["guest_id"])
+    )
+    if not o or (not is_owner and not (owner["user"] and owner["user"]["role"] == "admin")):
         raise HTTPException(404, "Order not found")
     try:
         db.execute("BEGIN")
@@ -891,7 +990,7 @@ INDEX_HTML = """<!DOCTYPE html>
              class="muted"
              data-testid="guest-hint"
              style="margin-bottom:10px;">
-          Browsing as guest. Your cart is saved to a cookie.
+          Browsing as guest. Your cart and orders are saved to this browser.
         </div>
 
         <div class="auth-tabs" id="authTabs" data-testid="auth-tabs">
@@ -1023,8 +1122,8 @@ function applyRoleUI() {
   document.getElementById("registerForm").classList.add("hidden");
   document.getElementById("guestHint").classList.toggle("hidden", loggedIn);
 
-  document.getElementById("ordersCard").classList.toggle("hidden", !loggedIn);
-  document.getElementById("ordersCard").dataset.visible = String(loggedIn);
+  document.getElementById("ordersCard").classList.toggle("hidden", admin);
+  document.getElementById("ordersCard").dataset.visible = String(!admin);
 
   document.getElementById("cartCard").classList.toggle("hidden", admin);
   document.getElementById("cartCard").dataset.visible = String(!admin);
@@ -1279,11 +1378,11 @@ async function loadCart() {
 
   const co = document.getElementById("checkoutBtn");
   const loggedIn = isLoggedIn();
-  co.disabled = !loggedIn;
-  co.dataset.enabled = String(loggedIn);
-  co.textContent = loggedIn ? "Checkout" : "Log in to checkout";
-  co.style.opacity = loggedIn ? "1" : "0.6";
-  co.style.cursor = loggedIn ? "pointer" : "not-allowed";
+  co.disabled = false;
+  co.dataset.enabled = "true";
+  co.textContent = loggedIn ? "Checkout" : "Checkout as guest";
+  co.style.opacity = "1";
+  co.style.cursor = "pointer";
 }
 
 async function removeItem(productId) {
@@ -1307,7 +1406,7 @@ async function checkout() {
 }
 
 async function loadOrders() {
-  if (!user) return;
+  if (isAdmin()) return;
   const r = await fetch("/api/orders", { headers: authHeaders() });
   const orders = await r.json();
   document.getElementById("orders").innerHTML = orders.length
@@ -1330,7 +1429,7 @@ async function loadOrders() {
   await loadMe();
   await loadProducts();
   await loadCart();
-  if (user) loadOrders();
+  loadOrders();
 })();
 </script>
 </body>

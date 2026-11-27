@@ -359,8 +359,14 @@ python shop.py
 
 Open http://localhost:8000. The app creates its tables and seed data
 automatically when it starts. The sample admin credentials are `admin` /
-`admin1234`. To use another PostgreSQL server, set `DATABASE_URL` before
-launching; that explicit setting takes precedence over Docker auto-detection.
+`admin1234`, and the sample customer credentials are `customer` /
+`customer1234`; these demo credentials are for local testing only. Customers
+can also register through the app or `/api/register`.
+Guests can add items and check out without logging in; inventory is deducted
+when checkout succeeds, and guest orders remain available in the same browser
+through its guest cookie. To use another PostgreSQL server, set `DATABASE_URL`
+before launching; that explicit setting takes precedence over Docker
+auto-detection.
 
 To inspect PostgreSQL in another terminal:
 
@@ -393,9 +399,9 @@ docker compose ps
 
 **This deletes all PostgreSQL data in this Compose project**, including
 registered users, orders, carts, and product changes. Once `db` is healthy,
-launch `shop.py` again. Startup recreates the schema, admin account, and
-original sample products. This does not delete or reset the SQLite `shop.db`
-file.
+launch `shop.py` again. Startup recreates the schema, sample admin and customer
+accounts, and original sample products. This does not delete or reset the
+SQLite `shop.db` file.
 
 To reset the SQLite database instead, stop the app and remove `shop.db`, then
 start `python3 shop.py` again. The tables and sample data are recreated on
